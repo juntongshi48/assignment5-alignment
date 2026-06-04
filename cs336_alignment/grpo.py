@@ -107,6 +107,7 @@ def compute_group_normalized_rewards(
     raw_rewards: torch.Tensor,
     group_size: int,
     baseline: Literal["mean", "none"] = "mean",
+    positive_group_bias: float = None,
     advantage_eps: float = 1e-6,
     advantage_normalizer: Literal["std", "none", "mean"] = "std",
 ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -117,6 +118,10 @@ def compute_group_normalized_rewards(
         advantages = rewards - baseline_values
     elif baseline == "none":
         advantages = rewards
+    
+    if positive_group_bias is not None:
+        tilt = 1.0 + positive_group_bias * torch.sign(advantages)
+        advantages = advantages * tilt
     
     if advantage_normalizer == "std":
         normalizer_values = advantages.std(dim=1, keepdim=True) + advantage_eps
@@ -215,10 +220,17 @@ def compute_policy_gradient_loss(
             ratios * raw_rewards_or_advantages,
             clipped_ratios * raw_rewards_or_advantages,
         )
-        metadata["grpo_clip_fraction"] = (
-            (ratios > 1.0 + cliprange)
-            | (ratios < 1.0 - cliprange)
-        ).float().mean().item()
+        is_clipped = (ratios > 1.0 + cliprange) | (ratios < 1.0 - cliprange)
+        if response_mask is not None:
+            mask = response_mask.bool()
+            clip_numerator = (is_clipped & mask).sum()
+            clip_denominator = mask.sum()
+        else:
+            clip_numerator = is_clipped.sum()
+            clip_denominator = torch.tensor(is_clipped.numel(), device=is_clipped.device)
+        metadata["clip_numerator"] = clip_numerator.detach()
+        metadata["clip_denominator"] = clip_denominator.detach()
+        metadata["clip_fraction"] = (clip_numerator / clip_denominator.clamp(min=1)).item()
         return per_token_policy_gradient_loss, metadata
     if importance_reweighting_method == "gspo":
         token_count = response_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
@@ -234,13 +246,44 @@ def compute_policy_gradient_loss(
             clipped_sequence_ratio * raw_rewards_or_advantages,
         )
         per_token_policy_gradient_loss = -selected_obj.expand_as(policy_log_probs)  # give all tokens the same sequence-level loss
-        metadata["gspo_clip_fraction"] = (
-            (sequence_ratio > 1.0 + cliprange)
-            | (sequence_ratio < 1.0 - cliprange)
-        ).float().mean().item()
+        is_clipped = (sequence_ratio > 1.0 + cliprange) | (sequence_ratio < 1.0 - cliprange)
+        clip_numerator = is_clipped.sum()
+        clip_denominator = torch.tensor(is_clipped.numel(), device=is_clipped.device)
+        metadata["clip_numerator"] = clip_numerator.detach()
+        metadata["clip_denominator"] = clip_denominator.detach()
+        metadata["clip_fraction"] = (clip_numerator / clip_denominator.clamp(min=1)).item()
         return per_token_policy_gradient_loss, metadata
  
     
+def compute_old_log_probs(
+    model: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    repeated_prompts: list[str],
+    rollout_responses: list[str],
+    microbatch_size: int,
+    device: str | torch.device,
+) -> torch.Tensor:
+    tokenizer_out = tokenize_prompt_and_output(repeated_prompts, rollout_responses, tokenizer)
+    input_ids = tokenizer_out["input_ids"]
+    labels = tokenizer_out["labels"]
+    batch_size = input_ids.shape[0]
+
+    was_training = model.training
+    model.eval()
+    chunks = []
+    with torch.no_grad():
+        for i in range(0, batch_size, microbatch_size):
+            log_probs = get_response_log_probs(
+                model,
+                input_ids[i:i + microbatch_size].to(device),
+                labels[i:i + microbatch_size].to(device),
+            )["log_probs"]
+            chunks.append(log_probs.detach().cpu())
+    if was_training:
+        model.train()
+    return torch.cat(chunks, dim=0)
+
+
 def run_grpo_train_step(
     model: torch.nn.Module,
     tokenizer: PreTrainedTokenizerBase,
@@ -253,6 +296,7 @@ def run_grpo_train_step(
     repeated_ground_truths: list[str],
     group_size: int,
     baseline: Literal["mean", "none"] = "mean",
+    positive_group_bias: float = None,
     advantage_eps: float = 1e-6,
     advantage_normalizer: Literal["std", "none", "mean"] = "std",
     loss_normalization: Literal["sequence", "constant"] = "sequence",
@@ -269,7 +313,9 @@ def run_grpo_train_step(
     avg_format_rewards = 0.0
     total_entropy = 0.0
     total_active_tokens = 0
-    
+    total_clip_numerator = 0.0
+    total_clip_denominator = 0.0
+
     keep = []
     pruned_repeated_prompts = []
     pruned_rollout_responses = []
@@ -288,6 +334,7 @@ def run_grpo_train_step(
             rewards_mb,
             group_size,
             baseline=baseline,
+            positive_group_bias=positive_group_bias,
             advantage_eps=advantage_eps,
             advantage_normalizer=advantage_normalizer,
         )
@@ -308,6 +355,7 @@ def run_grpo_train_step(
             "format_rewards": avg_format_rewards,
             "token_entropy": 0.0,
             "grad_norm": None,
+            "clip_fraction": None,
         }
         optimizer.zero_grad()
         return torch.tensor(0.0, device=device), meta_data
@@ -344,7 +392,7 @@ def run_grpo_train_step(
             normalized_advantages_mb,
             log_probs_mb,
             importance_reweighting_method=importance_reweighting_method,
-            old_log_probs=old_log_probs[i:i+mb_size, :log_probs_mb.shape[1]] if old_log_probs is not None else None,
+            old_log_probs=old_log_probs[i:i+mb_size, :log_probs_mb.shape[1]].to(device) if old_log_probs is not None else None,
             cliprange=cliprange,
             response_mask=response_mask_mb if importance_reweighting_method in ["grpo", "gspo"] else None,
         )
@@ -365,6 +413,9 @@ def run_grpo_train_step(
         
         total_entropy += (token_entropy_mb * response_mask_mb).sum().detach().item()
         total_active_tokens += response_mask_mb.sum().item()
+        if "clip_numerator" in loss_metadata:
+            total_clip_numerator += loss_metadata["clip_numerator"].item()
+            total_clip_denominator += loss_metadata["clip_denominator"].item()
     # Update weights once across entire batch.
     grad_norm = None
     if max_grad_norm is not None:
@@ -382,6 +433,7 @@ def run_grpo_train_step(
         "format_rewards": avg_format_rewards,
         "token_entropy": total_entropy / total_active_tokens if total_active_tokens > 0 else 0.0,
         "grad_norm": grad_norm,
+        "clip_fraction": (total_clip_numerator / total_clip_denominator) if total_clip_denominator > 0 else None,
     }
     return avg_loss, meta_data
         

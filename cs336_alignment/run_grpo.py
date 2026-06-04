@@ -85,6 +85,12 @@ GRPO_CONFIGS = {
         "loss_normalization": "constant",
         "normalization_constant": NORMALIZATION_CONSTANT,
     },
+    "GRPO-tilted": {
+        "baseline": "mean",
+        "advantage_normalizer": "std",
+        "positive_group_bias": 0.5,
+        "loss_normalization": "sequence",
+    },
 }
 
 
@@ -136,11 +142,15 @@ def run_grpo(
     seed: int,
     grpo_cfg_name: str = "GRPO",
     exp_name: str = "grpo",
+    train_batch_size: int = TRAIN_BATCH_SIZE,
+    gradient_accumulation_steps: int = GRADIENT_ACCUMULATION_STEPS,
+    importance_reweighting_method: str = "none",
+    cliprange: float = None,
 ) -> None:
     import torch
     import wandb
     from cs336_alignment.checkpoint import get_model_and_tokenizer
-    from cs336_alignment.grpo import compute_rollout_rewards, run_grpo_train_step
+    from cs336_alignment.grpo import compute_old_log_probs, compute_rollout_rewards, run_grpo_train_step
     from cs336_alignment.vllm_utils import VLLMServer
 
     random.seed(seed)
@@ -152,12 +162,18 @@ def run_grpo(
     template = load_prompt_template(cfg["template_file"])
     use_stop = cfg["use_stop"]
 
+    gradient_step_per_batch = ROLLOUT_BATCH_SIZE // train_batch_size
+    microbatch_size = train_batch_size // gradient_accumulation_steps
+    assert ROLLOUT_BATCH_SIZE % train_batch_size == 0, "rollout batch must split evenly into train batches"
+    assert train_batch_size % gradient_accumulation_steps == 0, "train batch must split evenly into microbatches"
+    assert microbatch_size % GROUP_SIZE == 0, "each microbatch must contain whole groups"
+
     train_data = load_dataset(TRAIN_DATA_PATH, N_TRAIN_EXAMPLES)
     val_data = load_dataset(VAL_DATA_PATH, N_VAL_EXAMPLES)
 
     wandb.init(
         project=f"cs336-alignment-{exp_name}",
-        name=f"{grpo_cfg_name}_{prompt_style}_lr{learning_rate}_seed{seed}",
+        name=f"{grpo_cfg_name}_is-{importance_reweighting_method}_{prompt_style}_lr{learning_rate}_clip{cliprange}_seed{seed}",
         config={
             "model_id": MODEL_ID,
             "learning_rate": learning_rate,
@@ -168,7 +184,11 @@ def run_grpo(
             "num_rollout_steps": NUM_ROLLOUT_STEPS,
             "rollout_batch_size": ROLLOUT_BATCH_SIZE,
             "group_size": GROUP_SIZE,
-            "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
+            "train_batch_size": train_batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "gradient_step_per_batch": gradient_step_per_batch,
+            "importance_reweighting_method": importance_reweighting_method,
+            "cliprange": cliprange,
             "sampling_temperature": SAMPLING_TEMPERATURE,
             "sampling_max_tokens": SAMPLING_MAX_TOKENS,
             "max_grad_norm": MAX_GRAD_NORM,
@@ -213,42 +233,62 @@ def run_grpo(
             repeated_ground_truths = [gt for gt in gt_answers for _ in range(GROUP_SIZE)]
 
             policy.train()
-            loss, meta = run_grpo_train_step(
-                model=policy,
-                tokenizer=tokenizer,
-                optimizer=optimizer,
-                gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-                max_grad_norm=MAX_GRAD_NORM,
-                reward_fn=reward_fn,
-                repeated_prompts=repeated_prompts,
-                rollout_responses=rollout_responses,
-                repeated_ground_truths=repeated_ground_truths,
-                group_size=GROUP_SIZE,
-                **grpo_cfg
-            )
-
-            log = {
-                "train/loss": loss.item(),
-                "train/mean_reward": meta["total_rewards"],
-                "train/mean_format_reward": meta["format_rewards"],
-                "train/token_entropy": meta["token_entropy"],
-            }
-            if meta["grad_norm"] is not None:
-                log["train/grad_norm"] = meta["grad_norm"]
-            wandb.log(log, step=step)
-            grad_norm_str = f"{meta['grad_norm']:.4f}" if meta["grad_norm"] is not None else "None"
-            print(
-                f"Step {step}/{NUM_ROLLOUT_STEPS}: loss={loss.item():.4f}, "
-                f"reward={meta['total_rewards']:.4f}, "
-                f"grad_norm={grad_norm_str}",
-                flush=True,
-            )
-
+            old_log_probs = None
+            if importance_reweighting_method != "none":
+                old_log_probs = compute_old_log_probs(
+                    model=policy,
+                    tokenizer=tokenizer,
+                    repeated_prompts=repeated_prompts,
+                    rollout_responses=rollout_responses,
+                    microbatch_size=microbatch_size,
+                    device=POLICY_DEVICE,
+                )
+            for grad_step in range(gradient_step_per_batch):
+                start = grad_step * train_batch_size
+                end = start + train_batch_size
+                loss, meta = run_grpo_train_step(
+                    model=policy,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    gradient_accumulation_steps=gradient_accumulation_steps,
+                    max_grad_norm=MAX_GRAD_NORM,
+                    reward_fn=reward_fn,
+                    repeated_prompts=repeated_prompts[start:end],
+                    rollout_responses=rollout_responses[start:end],
+                    repeated_ground_truths=repeated_ground_truths[start:end],
+                    group_size=GROUP_SIZE,
+                    importance_reweighting_method=importance_reweighting_method,
+                    old_log_probs=old_log_probs[start:end] if old_log_probs is not None else None,
+                    cliprange=cliprange,
+                    **grpo_cfg
+                )
+                global_step = step * gradient_step_per_batch + grad_step
+                log = {
+                    "train/loss": loss.item(),
+                    "train/mean_reward": meta["total_rewards"],
+                    "train/mean_format_reward": meta["format_rewards"],
+                    "train/token_entropy": meta["token_entropy"],
+                    "global_step": global_step,
+                }
+                if meta["grad_norm"] is not None:
+                    log["train/grad_norm"] = meta["grad_norm"]
+                if meta["clip_fraction"] is not None:
+                    log["train/clip_fraction"] = meta["clip_fraction"]
+                wandb.log(log, step=global_step)
+                # Print metrics
+                grad_norm_str = f"{meta['grad_norm']:.4f}" if meta["grad_norm"] is not None else "None"
+                print(
+                    f"Step {step}:{grad_step}/{NUM_ROLLOUT_STEPS}: loss={loss.item():.4f}, "
+                    f"reward={meta['total_rewards']:.4f}, "
+                    f"grad_norm={grad_norm_str}",
+                    flush=True,
+                )
+            wandb.log({"rollout_step": step}, step=global_step)
             if (step + 1) % LOG_ROLLOUTS_EVERY_N_STEPS == 0:
                 table = wandb.Table(columns=["question", "gt_answer", "response"])
                 for i in range(min(8, n_prompts_per_rollout_batch)):
                     table.add_data(questions[i], gt_answers[i], rollout_responses[i * GROUP_SIZE])
-                wandb.log({"train/rollouts": table}, step=step)
+                wandb.log({"train/rollouts": table}, step=global_step)
 
             if (step + 1) % EVAL_EVERY_N_STEPS == 0:
                 policy.eval()
@@ -273,7 +313,7 @@ def run_grpo(
                         "val/mean_format_reward": mean_val_fmt,
                         "val/mean_response_length": mean_val_resp_len,
                     },
-                    step=step,
+                    step=global_step,
                 )
                 print(
                     f"  Val reward: {mean_val_reward:.4f}, format: {mean_val_fmt:.4f}, "
@@ -307,8 +347,22 @@ def run_grpo_on_modal(
     seed: int = 0,
     grpo_cfg_name: str = "GRPO",
     exp_name: str = "grpo",
+    train_batch_size: int = TRAIN_BATCH_SIZE,
+    gradient_accumulation_steps: int = GRADIENT_ACCUMULATION_STEPS,
+    importance_reweighting_method: str = "none",
+    cliprange: float = None,
 ) -> None:
-    run_grpo(learning_rate=learning_rate, prompt_style=prompt_style, seed=seed, grpo_cfg_name=grpo_cfg_name, exp_name=exp_name)
+    run_grpo(
+        learning_rate=learning_rate,
+        prompt_style=prompt_style,
+        seed=seed,
+        grpo_cfg_name=grpo_cfg_name,
+        exp_name=exp_name,
+        train_batch_size=train_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        importance_reweighting_method=importance_reweighting_method,
+        cliprange=cliprange,
+    )
 
 
 @app.local_entrypoint()
@@ -378,4 +432,53 @@ def modal_sweep_grpo_variants(
     futures = [
         run_grpo_on_modal.spawn(learning_rate=learning_rate, prompt_style=prompt_style, seed=s, grpo_cfg_name=grpo_cfg_name, exp_name=exp_name)
         for grpo_cfg_name in grpo_cfg_names for s in seeds
+    ]
+    
+    
+@app.local_entrypoint()
+def modal_sweep_off_policy(
+    learning_rate: float = 1e-5,
+    prompt_style: str = "r1_zero",
+) -> None:
+    exp_name = "off_policy_sweep"
+    seeds = [0, 1, 2, 3]
+    # seeds = [0]
+    grpo_cfg_name = "GRPO"
+
+    train_batch_size = 8
+    gradient_accumulation_steps = 1
+
+    importance_reweighting_methods = ["none", "noclip", "grpo", "gspo"]
+    clipranges = [None, None, 0.2, 3e-4]
+    print(f"Launching off policy sweep: lr={learning_rate}, prompt={prompt_style}, is_variant={importance_reweighting_methods}, seeds={seeds}")
+    futures = [
+        run_grpo_on_modal.spawn(
+            learning_rate=learning_rate,
+            prompt_style=prompt_style,
+            seed=s,
+            grpo_cfg_name=grpo_cfg_name,
+            exp_name=exp_name,
+            train_batch_size=train_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            importance_reweighting_method=importance_reweighting_method,
+            cliprange=cliprange,
+        )
+        for importance_reweighting_method, cliprange in zip(importance_reweighting_methods, clipranges) for s in seeds
+    ]
+    
+
+@app.local_entrypoint()
+def modal_my_variant(
+    learning_rate: float = 1e-5,
+    prompt_style: str = "r1_zero",
+) -> None:
+    exp_name = "grpo_variant_sweep"
+    seeds = [0, 1, 2, 3]
+    grpo_cfg_name = "GRPO-tilted"
+    # seeds = [0]
+    # grpo_cfg_names = ["GRPO"]
+    print(f"Launching my grpo variant: lr={learning_rate}, prompt={prompt_style}, grpo_variants={grpo_cfg_name}, seeds={seeds}")
+    futures = [
+        run_grpo_on_modal.spawn(learning_rate=learning_rate, prompt_style=prompt_style, seed=s, grpo_cfg_name=grpo_cfg_name, exp_name=exp_name)
+        for s in seeds
     ]
