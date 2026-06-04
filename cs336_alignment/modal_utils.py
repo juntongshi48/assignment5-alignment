@@ -26,8 +26,10 @@ import subprocess
 
 import modal
 
+from pathlib import Path, PurePosixPath
 
-SUNET_ID = "TODO"  # NOTE: modal_utils.py should remain unchanged other than adding your SUNET_ID.
+
+SUNET_ID = "juntong"  # NOTE: modal_utils.py should remain unchanged other than adding your SUNET_ID.
 if SUNET_ID == "TODO":
     raise ValueError("Please set SUNET_ID in cs336_alignment/modal_utils.py before running Modal jobs.")
 
@@ -39,6 +41,7 @@ RUN_TIMEOUT_SECONDS = 60 * 60
 WANDB_SECRET_NAME = "wandb"
 
 app = modal.App(f"cs336-a5-rlvr-{SUNET_ID}")
+result_volume = modal.Volume.from_name(f"alignment-{SUNET_ID}-results", create_if_missing=True, version=2)
 wandb_secret = modal.Secret.from_name(WANDB_SECRET_NAME)
 
 image = (
@@ -98,3 +101,7 @@ def submit_commands(commands: list[list[str]]) -> None:
     if failures:
         print(f"{len(failures)} of {len(commands)} Modal jobs failed.", flush=True)
         raise SystemExit(1)
+
+VOLUME_MOUNTS: dict[str | PurePosixPath, modal.Volume | modal.CloudBucketMount] = {
+    "/root/results": result_volume,
+}

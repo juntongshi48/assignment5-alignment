@@ -46,7 +46,12 @@ def run_tokenize_prompt_and_output(
                 with labels, with value 1 where the corresponding label token
                 is part of the response and 0 otherwise.
     """
-    raise NotImplementedError
+    from cs336_alignment.grpo import tokenize_prompt_and_output
+    return tokenize_prompt_and_output(
+        prompt_strs=prompt_strs,
+        output_strs=output_strs,
+        tokenizer=tokenizer,
+    )
 
 
 def run_get_response_log_probs(
@@ -82,7 +87,13 @@ def run_get_response_log_probs(
                 entropy for each position (present only if
                 return_token_entropy=True).
     """
-    raise NotImplementedError
+    from cs336_alignment.grpo import get_response_log_probs
+    return get_response_log_probs(
+        model=model,
+        input_ids=input_ids,
+        labels=labels,
+        return_token_entropy=return_token_entropy,
+    )
 
 
 def run_compute_rollout_rewards(
@@ -114,7 +125,12 @@ def run_compute_rollout_rewards(
                 Reward statistics to log. At minimum, include the mean total
                 and format rewards over the rollout batch.
     """
-    raise NotImplementedError
+    from cs336_alignment.grpo import compute_rollout_rewards
+    return compute_rollout_rewards(
+        reward_fn=reward_fn,
+        rollout_responses=rollout_responses,
+        repeated_ground_truths=repeated_ground_truths,
+    )
 
 
 def run_compute_group_normalized_rewards(
@@ -153,7 +169,14 @@ def run_compute_group_normalized_rewards(
                 your choice of other statistics to log (e.g. mean, std, max/min
                 of rewards).
     """
-    raise NotImplementedError
+    from cs336_alignment.grpo import compute_group_normalized_rewards
+    return compute_group_normalized_rewards(
+        raw_rewards=raw_rewards,
+        group_size=group_size,
+        baseline=baseline,
+        advantage_eps=advantage_eps,
+        advantage_normalizer=advantage_normalizer,
+    )
 
 
 def run_compute_policy_gradient_loss(
@@ -200,7 +223,15 @@ def run_compute_policy_gradient_loss(
                 Statistics from the underlying loss call, such as
                 clip-fraction components.
     """
-    raise NotImplementedError
+    from cs336_alignment.grpo import compute_policy_gradient_loss
+    return compute_policy_gradient_loss(
+        raw_rewards_or_advantages=raw_rewards_or_advantages,
+        policy_log_probs=policy_log_probs,
+        importance_reweighting_method=importance_reweighting_method,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+        response_mask=response_mask,
+    )
 
 
 def run_aggregate_loss_across_microbatch(
@@ -232,7 +263,13 @@ def run_aggregate_loss_across_microbatch(
             A scalar containing the average loss. Make sure you can later call
             backward on this loss.
     """
-    raise NotImplementedError
+    from cs336_alignment.grpo import aggregate_loss_across_microbatch
+    return aggregate_loss_across_microbatch(
+        per_token_policy_gradient_loss=per_token_policy_gradient_loss,
+        mask=mask,
+        loss_normalization=loss_normalization,
+        normalization_constant=normalization_constant,
+    )
 
 
 def run_grpo_train_step(
@@ -321,7 +358,27 @@ def run_grpo_train_step(
                 Dict with metadata from the underlying loss call, gradient norm
                 before clipping, and any other statistics you might want to log.
     """
-    raise NotImplementedError
+    from cs336_alignment.grpo import run_grpo_train_step
+    return run_grpo_train_step(
+        model=model,
+        tokenizer=tokenizer,
+        optimizer=optimizer,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        max_grad_norm=max_grad_norm,
+        reward_fn=reward_fn,
+        repeated_prompts=repeated_prompts,
+        rollout_responses=rollout_responses,
+        repeated_ground_truths=repeated_ground_truths,
+        group_size=group_size,
+        baseline=baseline,
+        advantage_eps=advantage_eps,
+        advantage_normalizer=advantage_normalizer,
+        importance_reweighting_method=importance_reweighting_method,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+        loss_normalization=loss_normalization,
+        normalization_constant=normalization_constant,
+    )
 
 
 """
